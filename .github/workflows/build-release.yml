@@ -132,6 +132,40 @@ jobs:
         working-directory: app
         run: pnpm install
 
+      # Sign macOS builds with the stable self-signed "Wisper Dev" cert so the
+      # code-signing *designated requirement* — and therefore the macOS TCC
+      # permission grants (Accessibility / Input Monitoring / Microphone) — stay
+      # constant across installs. Ad-hoc signing keys the requirement on the
+      # cdhash, which changes every build, which is why permissions "reset" on
+      # each reinstall. Imports the cert into a throwaway keychain. Falls back to
+      # ad-hoc when the secret isn't set, so a missing secret never hard-fails
+      # the build (it just warns and reverts to the old, resetting behaviour).
+      - name: Set up signing identity (macOS)
+        id: signing
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            echo "identity=-" >> "$GITHUB_OUTPUT"
+            echo "::warning::APPLE_CERTIFICATE secret not set — signing ad-hoc; macOS permissions will keep resetting on each reinstall."
+            exit 0
+          fi
+          CERT_PATH="$RUNNER_TEMP/wisper-cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/wisper-signing.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN_PATH" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+          rm -f "$CERT_PATH"
+          echo "identity=Wisper Dev" >> "$GITHUB_OUTPUT"
+
       - name: Build and upload to release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -144,9 +178,10 @@ jobs:
           WISPER_BUILD_TARGET: ${{ matrix.target_triple }}
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_target }}
           CMAKE_OSX_DEPLOYMENT_TARGET: ${{ matrix.macos_target }}
-          # CI runners lack the dev's local signing identity; ad-hoc sign. Updater
-          # bundles are verified via the minisign key, not the codesignature.
-          APPLE_SIGNING_IDENTITY: "-"
+          # Sign with the stable "Wisper Dev" cert imported above so TCC grants
+          # survive reinstalls; "-" (ad-hoc) only when no cert secret is present.
+          # Updater bundles are verified via the minisign key regardless.
+          APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.identity || '-' }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
