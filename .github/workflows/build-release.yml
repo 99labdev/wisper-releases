@@ -154,6 +154,7 @@ jobs:
             exit 0
           fi
           CERT_PATH="$RUNNER_TEMP/wisper-cert.p12"
+          PUBCERT="$RUNNER_TEMP/wisper-cert.crt"
           KEYCHAIN_PATH="$RUNNER_TEMP/wisper-signing.keychain-db"
           KEYCHAIN_PW="$(uuidgen)"
           echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
@@ -163,7 +164,14 @@ jobs:
           security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN_PATH" >/dev/null
           security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
-          rm -f "$CERT_PATH"
+          # codesign refuses an UNTRUSTED identity ("no identity found"), and a
+          # self-signed cert isn't trusted by default. Trust it as a code-signing
+          # root in the system keychain so codesign accepts it (the runner has
+          # passwordless sudo). End users never need this trust — TCC only pins to
+          # the cert-leaf designated requirement, which is what we want stable.
+          openssl pkcs12 -in "$CERT_PATH" -clcerts -nokeys -passin pass:"$APPLE_CERTIFICATE_PASSWORD" -out "$PUBCERT"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$PUBCERT"
+          rm -f "$CERT_PATH" "$PUBCERT"
           echo "identity=Wisper Dev" >> "$GITHUB_OUTPUT"
 
       - name: Build and upload to release
