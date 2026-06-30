@@ -1,0 +1,192 @@
+name: Build & Release
+
+# Builds the Wisper desktop app and publishes installers to THIS (public) repo's
+# releases. The app source lives in the PRIVATE repo 99labdev/wisper — running
+# the build here means GitHub Actions is free (public repos get unlimited
+# standard-runner minutes, macOS included) and tauri-action uploads to this repo
+# natively, so the updater's latest.json already carries public URLs (no mirror).
+#
+# Trigger manually: gh workflow run "Build & Release" -F ref=v1.0.0
+# `ref` is the git ref (tag/branch/sha) to check out from the private app repo;
+# it's also used as the release tag here.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "wisper (private) git ref to build — also the release tag"
+        required: true
+        default: "v1.0.0"
+
+jobs:
+  create-release:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create-release.outputs.result }}
+    steps:
+      - name: Create draft release
+        id: create-release
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const tag = context.payload.inputs.ref;
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `Wisper ${tag}`,
+              body: 'Download the installer for your platform from the assets below.',
+              draft: true,
+              prerelease: false,
+            });
+            return data.id;
+
+  build:
+    needs: create-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-15 + Xcode 26: the apple-metal crate (via screencapturekit /
+          # meeting transcription) compiles a Swift bridge that references macOS 26
+          # SDK symbols under #available(macOS 26). macos_target stays 11.0 (the
+          # apple-metal Swift package's declared minimum).
+          - platform: macos-15 # Apple Silicon
+            args: "--target aarch64-apple-darwin"
+            macos_target: "11.0"
+            target_triple: "aarch64-apple-darwin"
+          - platform: macos-15 # Intel
+            args: "--target x86_64-apple-darwin"
+            macos_target: "11.0"
+            target_triple: "x86_64-apple-darwin"
+          - platform: ubuntu-22.04
+            args: ""
+            macos_target: ""
+            target_triple: ""
+          - platform: windows-latest
+            args: ""
+            macos_target: ""
+            target_triple: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout app source (private repo)
+        uses: actions/checkout@v6
+        with:
+          repository: 99labdev/wisper
+          ref: ${{ github.event.inputs.ref }}
+          token: ${{ secrets.WISPER_SRC_TOKEN }}
+          path: app
+
+      # apple-metal needs the macOS 26 SDK at compile time (see matrix comment).
+      # macos-15 ships Xcode 26 but defaults to 16.4 (macOS 15 SDK) — select 26.
+      - name: Select Xcode 26 (macOS 26 SDK)
+        if: runner.os == 'macOS'
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26"
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libasound2-dev \
+            libxdo-dev
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./app/src-tauri -> target"
+
+      - name: Install frontend dependencies
+        working-directory: app
+        run: pnpm install
+
+      - name: Build and upload to release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          # Uploads to THIS repo's release (public) → latest.json gets public URLs.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Client backend config (public-by-design, kept as secrets).
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          # Cross-build the wisper-summarize sidecar for this leg's triple.
+          WISPER_BUILD_TARGET: ${{ matrix.target_triple }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_target }}
+          CMAKE_OSX_DEPLOYMENT_TARGET: ${{ matrix.macos_target }}
+          # CI runners lack the dev's local signing identity; ad-hoc sign. Updater
+          # bundles are verified via the minisign key, not the codesignature.
+          APPLE_SIGNING_IDENTITY: "-"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: app
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: ${{ matrix.args }}
+
+  # Add stable, version-less installer aliases so the website's
+  # /releases/latest/download/<name> links never change between versions. The
+  # versioned originals stay for the updater (referenced by latest.json).
+  aliases:
+    needs: [create-release, build]
+    if: ${{ always() && needs.create-release.result == 'success' }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.event.inputs.ref }}
+    steps:
+      - name: Upload version-less aliases
+        run: |
+          set -euo pipefail
+          mkdir dl && cd dl
+          for i in 1 2 3 4 5; do
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*' --clobber && break
+            echo "download attempt $i failed; retrying in 15s..."; sleep 15
+          done
+          ls -la
+          shopt -s nullglob
+          alias_for() {
+            case "$1" in
+              *_aarch64.dmg)    echo Wisper_aarch64.dmg ;;
+              *_x64.dmg)        echo Wisper_x64.dmg ;;
+              *_x64-setup.exe)  echo Wisper_x64-setup.exe ;;
+              *_amd64.AppImage) echo Wisper_amd64.AppImage ;;
+              *_amd64.deb)      echo Wisper_amd64.deb ;;
+              *.x86_64.rpm)     echo Wisper.x86_64.rpm ;;
+              *)                echo "" ;;
+            esac
+          }
+          for f in *; do
+            a=$(alias_for "$f"); [ -n "$a" ] || continue
+            [ "$f" = "$a" ] && continue
+            cp -f "$f" "$a"
+            gh release upload "$TAG" "$a" --repo "$GITHUB_REPOSITORY" --clobber
+            echo "alias: $f -> $a"
+          done
