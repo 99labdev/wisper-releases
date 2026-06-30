@@ -52,15 +52,20 @@ jobs:
         include:
           # macos-15 + Xcode 26: the apple-metal crate (via screencapturekit /
           # meeting transcription) compiles a Swift bridge that references macOS 26
-          # SDK symbols under #available(macOS 26). macos_target stays 11.0 (the
-          # apple-metal Swift package's declared minimum).
+          # SDK symbols under #available(macOS 26). macos_target is 12.0: the Swift
+          # bridge pulls a dynamic libswift_Concurrency.dylib dependency, and Swift
+          # Concurrency only ships in the OS from macOS 12. With a target < 12 the
+          # toolchain back-deploys it and bakes the build runner's Xcode path into
+          # the binary, so the app aborts at launch on any Mac without that exact
+          # Xcode. 12.0 → dyld loads it from the OS shared cache. Keep in sync with
+          # the app repo's tauri.conf.json minimumSystemVersion.
           - platform: macos-15 # Apple Silicon
             args: "--target aarch64-apple-darwin"
-            macos_target: "11.0"
+            macos_target: "12.0"
             target_triple: "aarch64-apple-darwin"
           - platform: macos-15 # Intel
             args: "--target x86_64-apple-darwin"
-            macos_target: "11.0"
+            macos_target: "12.0"
             target_triple: "x86_64-apple-darwin"
           - platform: ubuntu-22.04
             args: ""
